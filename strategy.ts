@@ -1,26 +1,28 @@
-// Ridge Runner: a momentum bot for the pump.fun replay (agent-fun/replay/v2).
+// Launch Dart: a launch sniper for the pump.fun replay (agent-fun/replay/v2).
 //
-// The idea is simple enough to state in one breath: new coins that are already
-// moving get bought small, runners are left alone until they fade, and losers
-// are cut fast. Every curve keeps a short tape of its recorded trades. A curve
-// becomes a buy when it is mature (past minAge slots since its CreateEvent, so
-// fresh bundled launches that get dumped in the first minute are skipped) and
-// its recent tape shows real buying: net SOL flowing in over the window, several
-// distinct buyers, a price that rose and is sitting near its window high, with
-// more inflow in the newer half of the window than the older half (acceleration,
-// not a single old spike).
+// The observation behind it: on a bonding curve, the only moment a small bot
+// can reliably be early is the launch itself. A few slots after a coin is
+// created, the tape already says whether the launch is clean or a dump in
+// waiting — how big the creator's own buy was, how many wallets piled in
+// beside them, whether the creator has already sold. This bot buys only
+// launches that pass those checks, takes profit fast, cuts losers faster, and
+// never holds past a dozen slots. Breadth is the point: hundreds of tiny
+// round trips, each risking a few cents of SOL, so no single rug can hurt and
+// the guardrail (round trips on 20+ coins) is cleared many times over.
 //
-// The first buy is small. The position is then added to only while it is
-// winning: each later batch adds addSol while the price holds at or above the
-// last buy's and the position is up, up to stakeSol. So false starts cost
-// little and runners get size. A position is sold whole on the first of: a
-// stop loss against cost, a trailing stop from its best close value (armed
-// once the position is up), or a time limit. A curve that completes is closed
-// by the replay itself.
-//
-// Guardrail probes keep the run above the minimum bar (round trips on 20+
-// coins): when my own fills or coins lag the pace set in block time, the bot
-// buys probeSol of a liquid curve and sells it as soon as the buy lands.
+// Entry (decided within maxAge slots of the CreateEvent):
+//   - the creator's own buy in the create slot is small (a big dev buy is a
+//     dump in waiting), at most maxBuyers distinct non-creator buyers so far
+//     (a launch bundled by many wallets is the creator's cluster), the
+//     creator has not sold, real SOL is at least minRealSol (so the 1% size
+//     cap still admits a minimum buy), and the price has not already run up
+//     past maxRunup over its create price (no chasing).
+// Exits (whole position, at once):
+//   - take profit at +tp over cost, stop loss at -sl under cost, a hard time
+//     limit of maxHold slots, or the moment the creator sells while held.
+// Buys are capped at 1% of the curve's real SOL (the harness's own cap), so a
+// buy on a thin launch is small by construction; the minimum buy keeps dust
+// out. One buy per coin, never re-entered.
 //
 // Deterministic by construction: no clock, no randomness, iteration only over
 // insertion-ordered maps fed by the batch stream. Two executions on the same
@@ -29,376 +31,210 @@
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Entry window in slots. */
-  window: number;
-  /** Net buy SOL (buys minus sells) over the window. */
-  minNetSol: number;
-  /** Buy trades in the window. */
-  minBuys: number;
-  /** Distinct buying wallets in the window. */
-  minBuyers: number;
-  /** Price now over price at the window start, minus 1. */
-  minPriceUp: number;
-  /** Upper bound on that rise: skip curves that already ran too far in one window. */
-  maxPriceUp: number;
-  /** Newer-half net inflow must be at least this multiple of the older half's. */
-  accel: number;
-  /** Price now at least this share of the window's high. */
-  nearHigh: number;
-  /** Curve real SOL bounds at entry. */
-  minRqSol: number;
-  maxRqSol: number;
-  /** Slots since the CreateEvent before an entry is allowed. */
+  /** Youngest age (slots since create) at which a coin may be bought. */
   minAge: number;
-  /** SOL put into one position (a single buy, no pyramid). */
+  /** Oldest age at which a first buy may still be decided. */
+  maxAge: number;
+  /** SOL to aim for per coin (each reply is still capped at 1% of real SOL). */
   stakeSol: number;
-  /** Smallest buy worth sending. */
+  /** Smallest single buy worth paying the tx fee for. */
   minBuySol: number;
-  /** Slippage on buys (bps); sells always go out at 10000. */
+  /** Real SOL reserve window at decision time. */
+  minRealSol: number;
+  maxRealSol: number;
+  /** Creator's own buys in the create slot: at most this (a big dev buy is a dump). */
+  maxDevBuySol: number;
+  /** Distinct non-creator buyers seen before entry, at most. */
+  maxBuyers: number;
+  /** Price now over the create price: at most this (no chasing a coin that ran). */
+  maxRunup: number;
+  /** Creator sold before entry: skip the coin. */
+  skipDevSold: boolean;
+  /** Slippage allowed on buys (bps). */
   buySlipBps: number;
-  /** Exits: stop loss against cost, trailing stop from the peak, time limit. */
+  /** Exit when the position is worth this much over its cost. */
+  takeProfit: number;
+  /** Exit when it is worth this much under its cost. */
   stopLoss: number;
-  trail: number;
-  /** The trailing stop arms once value reached cost * (1 + trailArm). */
-  trailArm: number;
-  /** Exit after this many slots held. */
+  /** Exit after holding this many slots. */
   maxHold: number;
-  /** Slots to wait after an exit before the same curve may be bought again. */
-  cooldown: number;
-  /** Most entries per curve over the run. */
-  maxEntries: number;
-  /** Most momentum positions open at once (the rest of max_open_positions is for probes). */
-  maxMain: number;
-  /** Guardrail pacing: the run must end with round trips on targetCoins coins. */
-  targetCoins: number;
-  targetFills: number;
-  paceSecs: number;
-  probeSol: number;
-  maxProbes: number;
-  /** Most SOL at cost across all positions at once (a drawdown guard). */
-  maxExposureSol: number;
-  /** First buy of a position (SOL): small, so false starts cost little. */
-  initialSol: number;
-  /** Each add-on buy (SOL), only while the position is up and the price holds. */
-  addSol: number;
+  /** Exit when the creator sells while held. */
+  exitOnDevSell: boolean;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  window: 40,
-  minNetSol: 0.5,
-  minBuys: 4,
-  minBuyers: 5,
-  minPriceUp: 0.12,
-  maxPriceUp: 1.5,
-  accel: 1.5,
-  nearHigh: 0.95,
-  minRqSol: 1,
-  maxRqSol: 80,
-  minAge: 300,
-  stakeSol: 0.5,
-  minBuySol: 0.01,
-  buySlipBps: 1500,
-  stopLoss: 0.15,
-  trail: 0.2,
-  trailArm: 0.05,
-  maxHold: 1200,
-  cooldown: 150,
-  maxEntries: 1,
-  maxMain: 4,
-  targetCoins: 25,
-  targetFills: 200,
-  paceSecs: 14_400,
-  probeSol: 0.02,
-  maxProbes: 1,
-  maxExposureSol: 5,
-  /** First buy of a position (SOL): the whole stake in one buy (no pyramid). */
-  initialSol: 0.5,
-  /** Each add-on buy (SOL): 0 = no adds; the whole stake goes in at the signal. */
-  addSol: 0,
+  minAge: 0,
+  maxAge: 4,
+  stakeSol: 0.08,
+  minBuySol: 0.005,
+  minRealSol: 0.5,
+  maxRealSol: 30,
+  maxDevBuySol: 2,
+  maxBuyers: 4,
+  maxRunup: 0.4,
+  skipDevSold: true,
+  buySlipBps: 10_000,
+  takeProfit: 0.18,
+  stopLoss: 0.1,
+  maxHold: 12,
+  exitOnDevSell: true,
 };
 
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
 
-interface Trade {
-  slot: number;
-  buy: boolean;
-  sol: number;
-  user: string;
-  price: number;
-}
-
-interface Tape {
-  created: number | null;
-  trades: Trade[];
-  entries: number;
-  lastExit: number;
+interface Coin {
+  createSlot: number;
+  creator: Pubkey;
+  /** The create-time reserves: the price run-up is measured against them. */
+  vq0: number;
+  vt0: number;
+  devBuy: number;
+  buyers: Set<Pubkey>;
+  devSold: boolean;
+  /** Never buy it again (exited, filtered out for good, or completed). */
+  done: boolean;
+  complete: boolean;
 }
 
 interface Held {
-  opened: number;
-  peakValue: number;
-  invested: number;
-  exiting: boolean;
-  filled: boolean;
-  /** Recorded price when the last buy was decided. */
-  lastAddPrice: number;
-  /** Close value at the latest batch (SOL, curve and tx fees deducted). */
-  lastValue: number;
+  openedSlot: number;
+  devSoldAtOpen: boolean;
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
-  const tapes = new Map<Pubkey, Tape>();
+  const coins = new Map<Pubkey, Coin>();
   const held = new Map<Pubkey, Held>();
-  /** Probe round trips in flight, by mint: false while buying, true once selling. */
-  const probes = new Map<Pubkey, boolean>();
-  /** My own filled orders and the coins they were on (harness closes excluded). */
-  let myFills = 0;
-  const myCoins = new Set<Pubkey>();
-  let firstTime: number | null = null;
-  let lastTime: number | null = null;
-  const keep = p.window + 5;
-
-  const tapeOf = (mint: Pubkey): Tape => {
-    let t = tapes.get(mint);
-    if (t === undefined) {
-      t = { created: null, trades: [], entries: 0, lastExit: -1e12 };
-      tapes.set(mint, t);
-    }
-    return t;
-  };
-
-  /** Entry signal on a curve's tape at slot `now`. */
-  const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
-    if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
-    if (t.created === null || now - t.created < p.minAge) return false;
-    const from = now - p.window;
-    const mid = now - p.window / 2;
-    let buySol = 0;
-    let sellSol = 0;
-    let buys = 0;
-    let netOld = 0;
-    let netNew = 0;
-    let startPrice = -1;
-    let high = 0;
-    let last = 0;
-    const byUser = new Map<string, number>();
-    for (const tr of t.trades) {
-      if (tr.slot <= from) {
-        startPrice = tr.price;
-        continue;
-      }
-      if (startPrice < 0) startPrice = tr.price;
-      const signed = tr.buy ? tr.sol : -tr.sol;
-      if (tr.slot <= mid) netOld += signed;
-      else netNew += signed;
-      if (tr.buy) {
-        buySol += tr.sol;
-        buys++;
-        byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
-      } else {
-        sellSol += tr.sol;
-      }
-      if (tr.price > high) high = tr.price;
-      last = tr.price;
-    }
-    if (buys < p.minBuys || byUser.size < p.minBuyers) return false;
-    const net = buySol - sellSol;
-    if (net < p.minNetSol) return false;
-    if (startPrice <= 0) return false;
-    const up = last / startPrice - 1;
-    if (up < p.minPriceUp || up > p.maxPriceUp) return false;
-    if (last < high * p.nearHigh) return false;
-    if (netNew <= 0 || netNew < p.accel * netOld) return false;
-    return true;
-  };
+  /** Mints with a sell in flight. */
+  const selling = new Set<Pubkey>();
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
-      const now = batch.slot;
-      const traded = new Set<Pubkey>();
-      for (const f of batch.fills) {
-        if (f.status === 'filled' && !f.client_id.startsWith('_')) {
-          myFills++;
-          myCoins.add(f.mint);
-        }
-      }
       for (const e of batch.events) {
-        if (e.block_time !== null) {
-          if (firstTime === null) firstTime = e.block_time;
-          if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
-        }
         if (e.event === 'CreateEvent') {
-          tapeOf(e.mint).created = e.slot;
-        } else if (e.event === 'TradeEvent') {
-          const t = tapeOf(e.mint);
-          const sol = Number(e.sol_amount) / LAMPORTS;
-          t.trades.push({
-            slot: e.slot,
-            buy: e.is_buy,
-            sol,
-            user: e.user,
-            price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
+          coins.set(e.mint, {
+            createSlot: e.slot,
+            creator: e.creator,
+            vq0: Number(e.virtual_quote_reserves),
+            vt0: Number(e.virtual_token_reserves),
+            devBuy: 0,
+            buyers: new Set(),
+            devSold: false,
+            done: false,
+            complete: false,
           });
-          traded.add(e.mint);
+        } else if (e.event === 'TradeEvent') {
+          const c = coins.get(e.mint);
+          if (c === undefined) continue;
+          const sol = Number(e.sol_amount) / LAMPORTS;
+          const isDev = e.user === c.creator;
+          if (e.is_buy) {
+            if (isDev && e.slot === c.createSlot) c.devBuy += sol;
+            else if (!isDev) c.buyers.add(e.user);
+          } else if (isDev) {
+            c.devSold = true;
+          }
+        } else {
+          const c = coins.get(e.mint);
+          if (c !== undefined) {
+            c.complete = true;
+            c.done = true;
+          }
         }
       }
-      for (const mint of traded) {
-        const t = tapes.get(mint)!;
-        let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
+      for (const f of batch.fills) {
+        if (f.client_id.startsWith('_')) {
+          held.delete(f.mint);
+          selling.delete(f.mint);
+        }
       }
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingByMint = new Map<Pubkey, number>();
-      for (const po of state.pending.values()) {
-        pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
+      for (const mint of [...selling]) {
+        let stillPending = false;
+        for (const po of state.pending.values()) {
+          if (po.order.mint === mint && po.order.side === 'sell') stillPending = true;
+        }
+        if (!stillPending) selling.delete(mint);
+      }
+      for (const mint of [...held.keys()]) {
+        if (!state.positions.has(mint) && !selling.has(mint)) {
+          let buyPending = false;
+          for (const po of state.pending.values()) {
+            if (po.order.mint === mint && po.order.side === 'buy') buyPending = true;
+          }
+          if (!buyPending) held.delete(mint);
+        }
       }
 
       const orders: OrderInput[] = [];
       const cap = state.hello.caps.max_orders_per_batch;
       const tx = Number(state.txFeeLamports()) / LAMPORTS;
+      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
 
-      // Exits first: stop loss, trailing stop, time limit. Sell the whole position.
-      for (const [mint, h] of held) {
-        const pos = state.positions.get(mint);
-        const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) {
-            held.delete(mint);
-            const t = tapeOf(mint);
-            if (h.filled) t.lastExit = now;
-            else t.entries--;
-          }
-          continue;
+      // Exits first: take profit, stop loss, time limit, creator sold.
+      for (const [mint, pos] of state.positions) {
+        if (orders.length >= cap) break;
+        if (selling.has(mint)) continue;
+        const c = coins.get(mint);
+        let h = held.get(mint);
+        if (h === undefined) {
+          h = { openedSlot: state.slot, devSoldAtOpen: c?.devSold ?? false };
+          held.set(mint, h);
         }
-        h.filled = true;
-        if (curve === undefined || curve.complete) continue;
         const mk = marks.get(mint);
-        const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
-        const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
+        const curve = state.curves.get(mint);
+        const vq = mk ? Number(mk.virtual_quote_reserves) : curve ? Number(curve.virtual_quote_reserves) : 0;
+        const vt = mk ? Number(mk.virtual_token_reserves) : curve ? Number(curve.virtual_token_reserves) : 0;
+        if (vt <= 0) continue;
         const tokens = Number(pos.token_amount);
         const value = ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
         const cost = Number(pos.cost_lamports) / LAMPORTS;
-        if (value > h.peakValue) h.peakValue = value;
-        h.lastValue = value;
-        let exit = h.exiting;
-        if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && h.peakValue >= cost * (1 + p.trailArm) && value < h.peakValue * (1 - p.trail)) exit = true;
-        if (!exit && now - h.opened > p.maxHold) exit = true;
+        let exit = false;
+        if (value >= cost * (1 + p.takeProfit)) exit = true;
+        if (value <= cost * (1 - p.stopLoss)) exit = true;
+        if (state.slot - h.openedSlot >= p.maxHold) exit = true;
+        if (c !== undefined && p.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
         if (!exit) continue;
-        h.exiting = true;
-        if (pendingByMint.has(mint)) {
-          let sellPending = false;
-          for (const po of state.pending.values()) {
-            if (po.order.mint === mint && po.order.side === 'sell') sellPending = true;
-          }
-          if (sellPending) continue;
-        }
-        if (orders.length >= cap) break;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        selling.add(mint);
+        if (c !== undefined) c.done = true;
       }
 
-      // Probe round trips: sell the whole probe as soon as its buy has landed.
-      for (const [mint, selling] of probes) {
-        const pos = state.positions.get(mint);
-        const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) probes.delete(mint);
+      // Entries: clean launches only, decided within maxAge slots of creation.
+      let free = Number(state.freeCashLamports()) / LAMPORTS;
+      let open = state.committedPositionCount();
+      for (const [mint, c] of coins) {
+        if (orders.length >= cap) break;
+        if (c.done || c.complete) continue;
+        const age = state.slot - c.createSlot;
+        if (age > p.maxAge) {
+          c.done = true;
           continue;
         }
-        if (curve === undefined || curve.complete || pendingByMint.has(mint)) continue;
-        if (orders.length >= cap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        if (!selling) probes.set(mint, true);
-      }
-
-      // Then entries and adds: a small first buy on the signal, then add-ons
-      // into strength only (price at/above the last buy's, position up).
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
-      let mainLeft = p.maxMain - held.size;
-      let exposure = 0;
-      for (const [mint, h] of held) {
-        exposure += Math.max(h.invested, Number(state.positions.get(mint)?.cost_lamports ?? 0n) / LAMPORTS);
-      }
-      for (const mint of traded) {
-        if (orders.length >= cap) break;
+        if (age < p.minAge) continue;
+        if (open >= state.hello.caps.max_open_positions) continue;
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
-        if (pendingByMint.has(mint) || probes.has(mint)) continue;
-        const t = tapes.get(mint)!;
-        const h = held.get(mint);
-        const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
-        const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        let want: number;
-        if (h === undefined) {
-          if (slotsLeft <= 0 || mainLeft <= 0) continue;
-          if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
-          if (!entrySignal(t, now, rqSol)) continue;
-          want = Math.min(p.initialSol, p.stakeSol);
-        } else {
-          // Add into strength only: still open, up, price holding, room to grow.
-          if (h.exiting || !h.filled || h.invested >= p.stakeSol - p.minBuySol) continue;
-          const pos = state.positions.get(mint);
-          if (pos === undefined) continue;
-          if (price < h.lastAddPrice) continue;
-          if (h.lastValue < Number(pos.cost_lamports) / LAMPORTS) continue;
-          if (rqSol > p.maxRqSol) continue;
-          want = Math.min(p.addSol, p.stakeSol - h.invested);
+        if (c.devSold && p.skipDevSold) {
+          c.done = true;
+          continue;
         }
+        const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
+        if (rqSol < p.minRealSol || rqSol > p.maxRealSol) continue;
+        if (c.devBuy > p.maxDevBuySol) continue;
+        if (c.buyers.size > p.maxBuyers) continue;
+        const vq = Number(curve.virtual_quote_reserves);
+        const vt = Number(curve.virtual_token_reserves);
+        const runup = (vq * c.vt0) / (vt * c.vq0) - 1;
+        if (runup > p.maxRunup) continue;
         const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
-        let amount = Math.min(capSol, want, p.maxExposureSol - exposure);
+        let amount = Math.min(capSol, p.stakeSol);
         if (amount > free - tx) amount = free - tx;
         if (amount < p.minBuySol) continue;
         const lamports = BigInt(Math.floor(amount * LAMPORTS));
         orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
         free -= amount + tx;
-        exposure += amount;
-        if (h === undefined) {
-          held.set(mint, {
-            opened: now,
-            peakValue: 0,
-            invested: amount,
-            exiting: false,
-            filled: false,
-            lastAddPrice: price,
-            lastValue: 0,
-          });
-          t.entries++;
-          slotsLeft--;
-          mainLeft--;
-        } else {
-          h.invested += amount;
-          h.lastAddPrice = price;
-        }
-      }
-
-      // Guardrail pacing: open a probe when fills or coins lag the pace.
-      if (probes.size < p.maxProbes && slotsLeft > 0 && firstTime !== null && lastTime !== null) {
-        const pace = Math.min(1, (lastTime - firstTime) / p.paceSecs);
-        const needCoins = myCoins.size < Math.ceil(p.targetCoins * pace);
-        const needFills = myFills < Math.ceil(p.targetFills * pace);
-        if (needCoins || needFills) {
-          const minRq = (p.probeSol * 10_000) / state.hello.caps.max_order_bps_of_real_reserve;
-          for (const mint of traded) {
-            if (orders.length >= cap || probes.size >= p.maxProbes) break;
-            if (held.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint)) continue;
-            if (needCoins && !needFills && myCoins.has(mint)) continue;
-            const curve = state.curves.get(mint);
-            if (curve === undefined || curve.complete) continue;
-            if (Number(curve.real_quote_reserves) / LAMPORTS < minRq * 1.5) continue;
-            if (free < p.probeSol + 2 * tx) break;
-            orders.push({
-              side: 'buy',
-              mint,
-              quote_lamports: BigInt(Math.floor(p.probeSol * LAMPORTS)),
-              max_slippage_bps: p.buySlipBps,
-            });
-            probes.set(mint, false);
-            free -= p.probeSol + tx;
-          }
-        }
+        c.done = true;
+        open += 1;
       }
       return orders;
     },

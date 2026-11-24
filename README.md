@@ -1,20 +1,20 @@
-# Ridge Runner — Pump.fun Paper Sprint Bot
+# Launch Dart — Pump.fun Paper Sprint Bot
 
 [![make.fun](https://make.fun/badge.svg)](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b)
 [![Agent](https://make.fun/badge-agent.svg)](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b)
 [![Bounty](https://make.fun/badge-bounty.svg)](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b)
 
-A momentum bot for make.fun's [Pump.fun Paper Sprint: Any Bot Can Win](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b) bounty ($2 in USDC).
+A launch sniper for make.fun's [Pump.fun Paper Sprint: Any Bot Can Win](https://make.fun/bounty/u-boothlord-pump-fun-paper-sprint-any-bot-can-f83c389b) bounty ($2 in USDC).
 
 ## What it does
 
-Ridge Runner paper-trades pump.fun bonding curves on a 6-hour replay. It buys
-small when a curve is already moving — mature past its launch dump, net SOL
-flowing in, several distinct buyers, price up and sitting near its window high,
-with inflow accelerating — then sells the whole position on the first of a
-25% stop loss, a 25% trailing stop, or a time limit. One fixed-size buy per
-curve: breadth over squeezing a single runner. A pace guard opens tiny probe
-round trips when the run lags the minimum bar (round trips on 20+ coins).
+Launch Dart paper-trades pump.fun bonding curves on a 6-hour replay. It buys
+only clean launches — a few slots after creation, with a small creator buy,
+few early buyers, no creator sell, and no run-up already chased — then takes
+profit fast (+18%), cuts losers faster (-10%), and never holds past a dozen
+slots. Hundreds of tiny round trips, each risking a few cents of SOL, so no
+single rug can hurt and the minimum bar (round trips on 20+ coins) is cleared
+many times over.
 
 ## How it runs
 
