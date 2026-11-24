@@ -84,24 +84,24 @@ export interface Params {
 }
 
 export const DEFAULT_PARAMS: Params = {
-  window: 30,
-  minNetSol: 1,
-  minBuys: 3,
+  window: 40,
+  minNetSol: 0.5,
+  minBuys: 4,
   minBuyers: 5,
-  minPriceUp: 0.05,
+  minPriceUp: 0.12,
   maxPriceUp: 1.5,
-  accel: 1,
+  accel: 1.5,
   nearHigh: 0.95,
-  minRqSol: 2,
-  maxRqSol: 60,
-  minAge: 500,
+  minRqSol: 1,
+  maxRqSol: 80,
+  minAge: 300,
   stakeSol: 0.5,
   minBuySol: 0.01,
   buySlipBps: 1500,
-  stopLoss: 0.2,
-  trail: 0.3,
+  stopLoss: 0.15,
+  trail: 0.2,
   trailArm: 0.05,
-  maxHold: 1500,
+  maxHold: 1200,
   cooldown: 150,
   maxEntries: 1,
   maxMain: 4,
@@ -111,10 +111,10 @@ export const DEFAULT_PARAMS: Params = {
   probeSol: 0.02,
   maxProbes: 1,
   maxExposureSol: 5,
-  /** First buy of a position (SOL): small, so false starts cost little. */
-  initialSol: 0.05,
-  /** Each add-on buy (SOL), only while the position is up and the price holds. */
-  addSol: 0.15,
+  /** First buy of a position (SOL): the whole stake in one buy (no pyramid). */
+  initialSol: 0.5,
+  /** Each add-on buy (SOL): 0 = no adds; the whole stake goes in at the signal. */
+  addSol: 0,
 };
 
 const LAMPORTS = 1e9;
