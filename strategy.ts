@@ -10,11 +10,13 @@
 // more inflow in the newer half of the window than the older half (acceleration,
 // not a single old spike).
 //
-// One buy per curve, one fixed size. No pyramiding: on a 6-hour window the edge
-// is breadth (the guardrail needs round trips on 20+ coins), not squeezing one
-// runner. A position is sold whole on the first of: a stop loss against cost, a
-// trailing stop from its best close value (armed once the position is up), or a
-// time limit. A curve that completes is closed by the replay itself.
+// The first buy is small. The position is then added to only while it is
+// winning: each later batch adds addSol while the price holds at or above the
+// last buy's and the position is up, up to stakeSol. So false starts cost
+// little and runners get size. A position is sold whole on the first of: a
+// stop loss against cost, a trailing stop from its best close value (armed
+// once the position is up), or a time limit. A curve that completes is closed
+// by the replay itself.
 //
 // Guardrail probes keep the run above the minimum bar (round trips on 20+
 // coins): when my own fills or coins lag the pace set in block time, the bot
@@ -75,27 +77,31 @@ export interface Params {
   maxProbes: number;
   /** Most SOL at cost across all positions at once (a drawdown guard). */
   maxExposureSol: number;
+  /** First buy of a position (SOL): small, so false starts cost little. */
+  initialSol: number;
+  /** Each add-on buy (SOL), only while the position is up and the price holds. */
+  addSol: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  window: 40,
-  minNetSol: 0.5,
-  minBuys: 4,
-  minBuyers: 4,
-  minPriceUp: 0.08,
-  maxPriceUp: 2.0,
+  window: 30,
+  minNetSol: 1,
+  minBuys: 3,
+  minBuyers: 5,
+  minPriceUp: 0.05,
+  maxPriceUp: 1.5,
   accel: 1,
-  nearHigh: 0.92,
-  minRqSol: 1,
-  maxRqSol: 80,
-  minAge: 300,
+  nearHigh: 0.95,
+  minRqSol: 2,
+  maxRqSol: 60,
+  minAge: 500,
   stakeSol: 0.5,
   minBuySol: 0.01,
   buySlipBps: 1500,
-  stopLoss: 0.25,
-  trail: 0.25,
-  trailArm: 0.1,
-  maxHold: 1200,
+  stopLoss: 0.2,
+  trail: 0.3,
+  trailArm: 0.05,
+  maxHold: 1500,
   cooldown: 150,
   maxEntries: 1,
   maxMain: 4,
@@ -105,6 +111,10 @@ export const DEFAULT_PARAMS: Params = {
   probeSol: 0.02,
   maxProbes: 1,
   maxExposureSol: 5,
+  /** First buy of a position (SOL): small, so false starts cost little. */
+  initialSol: 0.05,
+  /** Each add-on buy (SOL), only while the position is up and the price holds. */
+  addSol: 0.15,
 };
 
 const LAMPORTS = 1e9;
@@ -131,6 +141,10 @@ interface Held {
   invested: number;
   exiting: boolean;
   filled: boolean;
+  /** Recorded price when the last buy was decided. */
+  lastAddPrice: number;
+  /** Close value at the latest batch (SOL, curve and tx fees deducted). */
+  lastValue: number;
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
@@ -267,6 +281,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const value = ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
         const cost = Number(pos.cost_lamports) / LAMPORTS;
         if (value > h.peakValue) h.peakValue = value;
+        h.lastValue = value;
         let exit = h.exiting;
         if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
         if (!exit && h.peakValue >= cost * (1 + p.trailArm) && value < h.peakValue * (1 - p.trail)) exit = true;
@@ -298,7 +313,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         if (!selling) probes.set(mint, true);
       }
 
-      // Then entries: one fixed-size buy per curve that passes the signal.
+      // Then entries and adds: a small first buy on the signal, then add-ons
+      // into strength only (price at/above the last buy's, position up).
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
       let mainLeft = p.maxMain - held.size;
@@ -311,24 +327,51 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
         if (pendingByMint.has(mint) || probes.has(mint)) continue;
-        if (held.has(mint)) continue;
         const t = tapes.get(mint)!;
-        if (slotsLeft <= 0 || mainLeft <= 0) continue;
-        if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
+        const h = held.get(mint);
+        const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        if (!entrySignal(t, now, rqSol)) continue;
+        let want: number;
+        if (h === undefined) {
+          if (slotsLeft <= 0 || mainLeft <= 0) continue;
+          if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
+          if (!entrySignal(t, now, rqSol)) continue;
+          want = Math.min(p.initialSol, p.stakeSol);
+        } else {
+          // Add into strength only: still open, up, price holding, room to grow.
+          if (h.exiting || !h.filled || h.invested >= p.stakeSol - p.minBuySol) continue;
+          const pos = state.positions.get(mint);
+          if (pos === undefined) continue;
+          if (price < h.lastAddPrice) continue;
+          if (h.lastValue < Number(pos.cost_lamports) / LAMPORTS) continue;
+          if (rqSol > p.maxRqSol) continue;
+          want = Math.min(p.addSol, p.stakeSol - h.invested);
+        }
         const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
-        let amount = Math.min(capSol, p.stakeSol, p.maxExposureSol - exposure);
+        let amount = Math.min(capSol, want, p.maxExposureSol - exposure);
         if (amount > free - tx) amount = free - tx;
         if (amount < p.minBuySol) continue;
         const lamports = BigInt(Math.floor(amount * LAMPORTS));
         orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
         free -= amount + tx;
         exposure += amount;
-        held.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false });
-        t.entries++;
-        slotsLeft--;
-        mainLeft--;
+        if (h === undefined) {
+          held.set(mint, {
+            opened: now,
+            peakValue: 0,
+            invested: amount,
+            exiting: false,
+            filled: false,
+            lastAddPrice: price,
+            lastValue: 0,
+          });
+          t.entries++;
+          slotsLeft--;
+          mainLeft--;
+        } else {
+          h.invested += amount;
+          h.lastAddPrice = price;
+        }
       }
 
       // Guardrail pacing: open a probe when fills or coins lag the pace.
